@@ -1,8 +1,12 @@
 from data_loader import DataLoader
 import numpy as np
 from scipy.signal import lfilter, firwin, filtfilt, savgol_filter, find_peaks
+import scipy
 from scipy.signal.windows import hamming
-from spectrum import arburg
+from spectrum import arma2psd, arburg
+from pylab import log10, pi, plot, xlabel, randn
+import matplotlib.pyplot as plt
+from scipy.fft import fft, fftfreq
 
 class AccelerometerData(DataLoader):
     def __init__(self, file_path, frequency):
@@ -63,14 +67,17 @@ class AccelerometerData(DataLoader):
             Array of segmented windows.
         """
         step_size = int(window_size * (1 - overlap_ratio))
-        n_samples = self.data.shape[0]
+        n_samples = self.data.shape[1]
         n_windows = (n_samples - window_size) // step_size + 1
         hamming_window = hamming(window_size)
-        segments = np.zeros((n_windows, window_size, self.data.shape[1]))
-        for i in range(n_windows):
-            start_idx = i * step_size
-            end_idx = start_idx + window_size
-            segments[i] = self.data[start_idx:end_idx] * hamming_window[:, np.newaxis]
+        segments = np.zeros((self.data.shape[0], window_size, n_windows))
+        
+        for x in range(self.data.shape[0]):
+            for i in range(n_windows):
+                start_idx = i * step_size
+                end_idx = start_idx + window_size
+                segments[x, :, i] = self.data[x, start_idx:end_idx] * hamming_window
+                
         self.data = segments
 
     def detect_peak_frequency(self, fs=100, low_freq=3, high_freq=8, ar_order=6):
@@ -86,38 +93,53 @@ class AccelerometerData(DataLoader):
             Peak frequency if within tremor range, otherwise 1.
         """
         new_data = [[], [], []]
-
         for i in range(3):
-            for d in self.data[i]:
-                # Fit the data using Berg Method (use a library)
+            for j in range(self.data.shape[2]):
+                d = self.data[i, :, j]
                 [A, P, K] = arburg(d, ar_order)
+                
                 # Generate the frequency response from the AR coefficients
                 freqs = np.linspace(
                     0, fs / 2, 512
                 )  # Frequency range up to Nyquist frequency
-                _, h = np.linalg.eigh(
-                    np.polyval(A, np.exp(-1j * 2 * np.pi * freqs / fs))
-                )
-                psd = np.abs(h) ** 2
+                #_, h = np.linalg.eigh(
+                #    np.polyval(A, np.exp(-1j * 2 * np.pi * freqs / fs))
+                #)
+
+                PSD = arma2psd(A, rho=P, NFFT=512)
+                PSD = PSD[len(PSD):len(PSD)//2:-1]
+                xf = np.linspace(0, 1, len(PSD)) * 100 / 2 #multiply normalized frequency by Nyquist frequency 
+                PSD = (np.abs(PSD) ** 2)
+
                 # Normalize the power spectral density (PSD)
-                psd /= np.sum(psd)
+                #PSD /= np.sum(PSD)
+
                 # Find the frequency bin corresponding to the maximum power
-                peaks, _ = find_peaks(psd)
+                peaks, _ = find_peaks(PSD)
                 if peaks.size == 0:
                     new_data[i].append(1)  # No peaks detected
-                    return
+                    continue
+    
                 # Convert peak indices to frequencies
-                peak_freqs = freqs[peaks]
+                peak_freqs = xf[peaks]
+
                 # Filter peaks within the desired frequency range
-                tremor_peaks = peak_freqs[
-                    (peak_freqs >= low_freq) & (peak_freqs <= high_freq)
-                ]
-                # Return the dominant tremor frequency, if any
+                tremor_peaks = peak_freqs[(peak_freqs >= low_freq) & (peak_freqs <= high_freq)]
                 if tremor_peaks.size > 0:
-                    new_data[i].append(tremor_peaks[np.argmax(psd[peaks])])
+                    PSD_indices = xf == tremor_peaks
+
+                #obtain peak power to filter out low vibrations 
+                peak_max = np.max(PSD[peaks])
+                
+                # Return the dominant tremor frequency, if any, with sufficient power magnitude
+                if tremor_peaks.size > 0 and (np.max(PSD[PSD_indices]) > peak_max / 10):
+                    xf_PSD_indices = xf[PSD_indices]
+                    new_data[i].append(xf_PSD_indices[np.argmax(PSD[PSD_indices])])
                 else:
                     new_data[i].append(1)
                     # No peak within the tremor ra
+        
+        self.data = new_data
 
     def _smooth_data(self, window_size=50):
         self.data = savgol_filter(self.data, window_size, 3)
@@ -125,10 +147,29 @@ class AccelerometerData(DataLoader):
 
     def _multiply(self):
         self.data = self.data[0] * self.data[1] * self.data[2]
+    
 
     def _thresholding(self, threshold=3.5):
-        for i in range(self.data.shape[0]):
-            self.data[i] = 1 if self.data[i] > threshold else 0
+        threshold_mask = self.data > threshold 
+        self.data[threshold_mask] = 1
+        self.data[~threshold_mask] = 0
+
+    def check_duration(self, duration = 300):
+        window_beg = 0
+        window_end = window_beg + duration
+
+        time_stamp = np.zeros(len(self.data))
+        while window_end < len(self.data):
+            if not np.sum(self.data[window_beg:window_end] == 0):
+                time_stamp[window_beg:window_end] = 1
+                window_beg = window_end
+                
+            window_beg += 1
+            window_end = window_beg + duration
+
+        return time_stamp 
+
+
 
     def _feature_extraction(self, threshold=3):
         start = None
@@ -143,16 +184,22 @@ class AccelerometerData(DataLoader):
                         self.features.append((start, end, end - start + 1))
                     start = None
 
+    def resample(self, size): 
+        self.data = scipy.signal.resample(self.data, size, axis = -1)
+
     def preprocess_data(self):
+        time_series_length = self.data.shape[1]
         self._remove_drift()
         self._bandpass_filter()
-        print(self.data.shape)
         self.segment_data(300, 0.9)
         self.detect_peak_frequency()
+        self.resample(time_series_length) 
+       
         #### 
         self._smooth_data()
         self._multiply()
         self._thresholding()
+        self.data = self.check_duration()
 
     def plot_data(self, t_start=0, t_end=None):
         import matplotlib.pyplot as plt
